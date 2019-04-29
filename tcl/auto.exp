@@ -1,0 +1,334 @@
+#! /usr/bin/tclsh
+# -*- mode: tcl -*-
+
+package require Expect
+package require Tcl 8.5
+package require http 2.7
+
+#set v [join [split $tcl_patchLevel .] ""]
+#if {$v < 860} {
+#    package require try
+#}
+#package require cmdline 1.5
+
+# TODO
+# configuration file
+
+set timeout 10
+set verbose 1
+#set prompt "\>\s*$|#\s*$|\\$\s*$"
+set prompt {>(?:\([^()]+\))?\s*$|#(?:\([^()]+\))?\s*$|\\\$(?:\([^()]+\))?\s*$}
+
+#set prompt {>\s*$|#\s*$|\\\$\s*$}
+set sid(ssh) 0
+set sid(scp) 0
+
+proc __connect {method host user rspec lspec} {
+    global spawn_id
+    global sid
+
+    switch -- $method {
+        ssh {
+            set args [list $user@$host]
+        }
+        scp {
+            set args [list $user@$host:$rspec $lspec]
+        }
+        default {
+        }
+    }
+
+    if {[catch {set procid [eval spawn $method [lrange $args 0 end]]} errmsg]} {
+        send_error "($method) ERROR: Failed to connect to $host ($args)\n====\n$errmsg\n====\n"
+        send_error "($method) retrying without variable args ....\n"
+
+        if {[catchg {set procid [spawn $method $args]} errmsg ]} {
+            send_error "($method) ERROR: Failed to connect to $host ($args)\n====\n$errmsg\n====\n"
+            exit 1
+        }
+    }
+
+    set sid($method) $spawn_id
+    return $procid
+}
+
+proc Connect {method host user passw enable device rpath lpath} {
+    global spawn_id
+    global timeout
+    global prompt
+    global sshid
+    global scpid
+    
+    set rc 0
+
+    if {[catch {set procid [__connect $method $host $user $rpath $lpath]} errmsg]} {
+        send_error "($method) ERROR: Failed to connect to host:\n====\n$errmsg\n====\n"
+        exit 1
+    }
+    send_user "procid=$procid  spawn_id=$spawn_id\n"
+    expect {
+        -nocase -re {(?:login|username|name):\s*$} {
+            send -- "$user\r"
+            exp_continue
+        }
+        -nocase -re {password:} {
+            send -- "$passw\r"
+            exp_continue
+        }
+        -nocase -re $prompt {
+            send_user -- "\nSUCCESS: logged in and ready to send commands\n"
+            if {[llength $enable] > 0} {
+                send_user "*** using enable mode\n"
+                send -- "enable\r"
+                expect {
+                    -timeout 3
+                    timeout {
+                        send_error "($method) ERROR: enable password timeout\n"
+                        set rc 3
+                    }
+                    eof {
+                        if {0 != [string compare $method "scp"]} {
+                            send_error "($method) ERROR(eof, enable): Connection to host failed:\n====\n$expect_out(buffer)\n====\n"
+                            set rc 4
+                        }
+                    }
+                    -nocase -re Password: {
+                        send -- "$enable\r"
+                    }
+                    -nocase -re $prompt {
+                        send_user -- "\n-- SUCCESS on enable mode --\n"
+                    }
+                }
+            }
+        }
+        timeout {
+            send_error "($method) ERROR: timeout waiting for prompt\n"
+            set rc 3
+        }
+        eof {
+            if {0 != [string compare $method "scp"]} {
+                send_error "($method) ERROR(eof): connection to host failed:\n====\n$expect_out(buffer)\n====\n"
+                set rc 4
+            }
+        }
+    }
+
+    return $rc
+}
+
+
+proc http_login {uri username password {headers {}}} {
+    set fields [split $uri {/}]
+    lassign $fields scheme _ign domain request
+    set scheme [string range $scheme 0 end-1]
+    set tfile "/tmp/${scheme}_$domain"
+    
+    if {[catch {set fd [open "$tfile" w]} emsg]} {
+        send_error "($scheme) failed to open file '$tfile': $emsg\n"
+        exit 1
+    }
+
+    set query [list user $username password $password]
+    set hdrs [list Connection keep-alive Keep-Alive 10 {*}$headers]
+
+    if {[catch {set query [eval ::http::formatQuery $query]} emsg]} {
+        send_error "($scheme) failed to format query: $emsg\n"
+        exit 1
+    }
+
+    if {[catch {set token [::http::geturl $uri -headers $hdrs -query $query]} emsg]} {
+        send_error "($scheme) failed to login: $emsg\n"
+        exit 1
+    }
+    ::http::wait $token
+
+    close $fd
+    return $token
+}
+
+# split proc_geturl and make it more flexible
+proc http_geturl {host user passwd ofile {chunk 4096}} {
+    global verbose
+
+    set token [http_login "http://$host/login" $user $passwd]
+    upvar #0 $token state
+    
+    foreach {name} $state(body) {
+        if {0 < [string length $name]} {
+            if {[regexp -nocase {document\.cookie=\"([^\"]+)\"} $name match _sid]} {
+                set sessionId [string trimright $_sid {;}]
+                if {$verbose > 0} {
+                    puts "match == <$match><$sessionId>"
+                }
+            }
+        }
+    }
+
+    if {0 < [string length $sessionId]} {
+        lappend headers Cookie $sessionId
+        if {[catch {set pool [::http::geturl "http://$host/mgmtpool.tcl?download=0" -headers $headers]} errmsg]} {
+            puts "FAILED to download config: $errmsg"
+            ::http::cleanup $pool
+            exit 1
+        }
+    }
+    ::http::wait $pool
+    upvar #0 $pool state
+
+    if {[string compare $state(status) ok] == 0} {
+        if {[catch {set outfile [open $ofile w]} errmsg]} {
+            puts stderr "FAILED to open file $ofile"
+            exit 3
+        }
+        puts $outfile $state(body)
+        close $outfile
+    } else {
+        puts stderr "FAILED: status: $state(status)"
+        exit 1
+    }
+
+#    close $o
+
+    ::http::cleanup $token
+    ::http::cleanup $pool
+}
+
+proc Usage {} {
+    puts stderr "Usage: auto.exp -h <host> -u <user> -p <pass> ?-f <file>? ?-e <enablepass>? ?-- <command string>?"
+    puts stderr "\n"
+    puts stderr "* required options"
+    puts stderr " -h <host|ip>    hostname or ip"
+    puts stderr " -u <user>       username"
+    puts stderr " -p <pass>       password"
+    puts stderr "\n"
+    puts stderr "* optional arguments"
+    puts stderr "-l <path>        output file or directory"
+    puts stderr " -f <file>       file containing command(s) to send"
+    puts stderr " -e <enablepass> password for enable mode"
+    puts stderr " -H              print this help"
+    puts stderr " -- <command string> command to send"
+    puts stderr "\n"
+
+    exit 1
+}
+
+
+set ec 0
+set username ""
+set hostname ""
+set password ""
+set enablepw ""
+set device   ""
+set rpath    ""
+set lpath    "."
+
+set method "telnet"
+set cmdfile ""
+set cmdstr  ""
+
+if {$::argc > 0} {
+    set idx 0
+    
+    foreach {flag arg} $argv {
+        switch -exact $flag {
+            -u {set username $arg; incr idx 2}
+            -p {set password $arg; incr idx 2}
+            -h {set hostname $arg; incr idx 2}
+            -m {set method   $arg; incr idx 2}
+            -e {set enablepw $arg; incr idx 2}
+            -f {set cmdfile  $arg; incr idx 2}
+            -d {set device   $arg; incr idx 2}
+            -l {set lpath    $arg; incr idx 2}
+            -r {set rpath    $arg; incr idx 2}
+            -o {set outfile  $arg; incr idx 2}
+            -v {set verbose  $arg; incr idx 2}
+            -c {set cmdstr   $arg; incr idx 2}
+            -H { Usage }
+            -- {incr idx; set cmdstr [lrange $argv $idx end]}
+        }
+    }
+
+    puts stderr "m=<$method> h=<$hostname> u=<$username> p=<$password> f=<$cmdfile> c=<$cmdstr>"
+    if {[llength $hostname] <= 0} {
+        send_error "missing required option for 'hostname'\n"
+        set ec 1
+    }
+    if {[llength $username] <= 0} {
+        send_error "missing required option for 'username'\n"
+        set ec 1
+    }
+    if {[llength $password] <= 0} {
+        send_error "missing required option for 'password'\n"
+        set ec 1
+    }
+
+    if { $ec > 0 } {
+        Usage
+    }
+}
+
+if { $ec == 0} {
+    if {[string compare $method "http"] == 0} {
+        if {[llength $outfile] <= 0} {
+            send_error "missing required option for 'outfile' \n"
+            exit 1
+        }
+        http_geturl $hostname $username $password $outfile
+    } else {
+        if {[llength $cmdstr] > 0} {
+            set sendtext $cmdstr
+        } elseif {[llength $cmdfile] > 0} {
+            if {[catch {set fd [open $cmdfile r]} errmsg]} {
+                puts stderr "ERROR: failed to open '$cmdfile' for reading: $errmsg"
+                exit 1
+            }
+            set sendtext [read $fd]
+            close $fd
+        } else {
+            puts "Enter the text to send (end with '.' on last line)"
+            expect_user -nocase -re "(.+)\n\.\n"
+            set sendtext $expect_out(1,string)
+
+        }
+
+        log_user $verbose
+        if {0 < [Connect "$method" "$hostname" "$username" "$password" "$enablepw" "$device" "$rpath" "$lpath"]} {
+            exit 1
+        }
+        log_user 1
+
+        if {0 != [string compare $sendtext "nil"]} {
+            foreach line [split $sendtext \n] {
+                if {[llength $line] > 0} {
+                    send_user -- "sending line <$line>\n"
+                    log_user $verbose
+
+                    send -- "$line\r"
+                    expect {
+                        -timeout 3
+                        -nocase -re {\"(/[^\"]+)\"} { # escaping quotes is not really required but needed to make the syntax highlighter happy -- @as
+                            send_user "File: $expect_out(1,string)\n"
+                            if {0 < [Connect "scp" "$hostname" "$username" "$password" "$enablepw" "$device" "$expect_out(1,string)" "$lpath"]} {
+                                exit 1
+                            }
+                            set spawn_id $sid(ssh)
+                        }
+                        -nocase -re $prompt {
+                        }
+                        -nocase -re "--more--" {
+                            send " "
+                            exp_continue
+                        }
+                    }
+                    log_user 1
+                }
+            }
+        }
+    }
+}
+
+if {[catch {send "exit\r"} err]} {
+    send_user "INFO $spawn_id already closed: $err\n"
+    exit 0
+}
+sleep 1

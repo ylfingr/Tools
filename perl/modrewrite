@@ -1,0 +1,520 @@
+#! /usr/bin/perl
+
+# @AUTHOR:    Axel Schmalowsky
+# @DATE:      2013-08-27
+
+# TODO:
+# * handle querystring                                                                                                                                                                                                                                                          
+# * inheritance?
+# * efficient and smarter error handling
+# * allow overwriting options via command line
+
+# Imports + Definitions
+use strict;
+use warnings;
+
+use constant {
+    NEWLINE => "\n",
+    ERROR => 0,
+    SUCCESS => 1,
+    NONE => -1,
+};
+use constant {
+    FALSE => 0,
+    TRUE  => 1,
+};
+
+use Data::Dumper::Again (purity => 1, indent => 1, useqq => 1, quotekeys => 1, sortkeys => 1, deparse => 0);
+my $dd = Data::Dumper::Again->new;
+
+use YAML;
+use Carp;
+
+use AnyEvent::HTTP;
+
+use Coro::LWP;
+use LWP;
+
+require HTTP::Request;
+require HTTP::Cookies;
+
+use Getopt::Long;
+Getopt::Long::Configure qw(bundling);
+
+use Term::ANSIColor qw(:constants);
+use Term::Size;
+
+
+# Code
+my ($cols, $rows) = Term::Size::chars *STDOUT{IO};
+
+my ($URL, $FILE, $COOKIES, $FIRST, $LAST,  $VERBOSE, $DUMP, $TIMEOUT, $PORT, $NOCOLOR);
+my $AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3766.2 Safari/537.36"
+
+GetOptions('u|url=s'     => \$URL,
+           'f|file=s'    => \$FILE,
+           'C|cookies=s' => \$COOKIES,
+           'P|port=s'    => \$PORT,
+           'v|verbose'   => \$VERBOSE,
+           't|timeout=i' => \$TIMEOUT,
+           's|skip=i'    => \$FIRST,
+           'e|last=i'    => \$LAST,
+           'a|agent=s'   => \$AGENT,
+           'D|Dump'      => \$DUMP,
+           'N|nocolor'   => \$NOCOLOR,
+    );
+
+
+# subroutine prototypes
+sub ok($$;@);
+sub failed($$;@);
+sub prepare($$);
+sub status($$);
+sub verify($$$;$);
+sub check();
+sub set_agent($$);
+sub set_cookies($$;$);
+sub set_timeout($$);
+sub load($);
+sub summary($);
+
+my $yaml = undef;
+if (defined $FILE) {
+    eval { $yaml = YAML::LoadFile($FILE) };
+    if ( $@ ) { # loading failed, try ...
+        $yaml = load($FILE);
+    }
+}
+
+print $dd->dump( $yaml ) if $DUMP;
+#exit(0);
+
+summary check;
+1;
+
+# subrouting definitions
+# ok :: Char -> Int ;-> [[Char]]; -> IO ([Char])
+# @sep :: Separator used for joining @@_
+# @w   :: Width
+# @msg :: @_
+sub ok($$;@) {
+    my $sep = shift;
+    my $w   = shift;
+    my $msg = join ' ', +(scalar @_ ? @_ : qw(ok));
+
+    if ($NOCOLOR) {
+        printf "%s %s", ($sep x $w), $msg;
+        return;
+    }
+    printf "%s %s %s %s %s", ($sep x $w), BOLD, GREEN, $msg, RESET;
+}
+
+# failed :: Char -> Int ;->[[Char]]; -> IO ([Char])
+# @sep  :: Separator used for joining @@_
+# @w    :: Width
+# @msg  :: @_
+sub failed($$;@) {
+    my $sep = shift;
+    my $w   = shift;
+    my $msg = join ' ', +(scalar @_ ? @_ : qw(failed));
+
+    if ($NOCOLOR) {
+        printf "%s %s", ($sep x $w), $msg;
+        return;
+    }
+    printf "%s %s %s %s %s", ($sep x $w), BOLD, RED, $msg, RESET;
+}
+
+# cprint :: Color:Constant -> IO ([Char])
+sub cprint {
+    my $color = shift;
+
+    if ($NOCOLOR) {
+        print @_;
+        return;
+    }
+    print BOLD, $color, @_, RESET, ;
+}
+
+# prepare :: String -> [[Char]] -> String
+# @pattern  :: String to match against
+# @patterns :: List of patterns/regexps to match agains @pattern
+sub prepare($$) {
+    my $pattern  = shift;
+    my $patterns = shift;
+    return $pattern unless defined $patterns;
+
+    if (q/HASH/ eq ref $patterns) {
+        $pattern =~ s/$_/$patterns->{$_}/xeg foreach (keys %{ $patterns });
+    } elsif (q/ARRAY/ eq ref $patterns) {
+        $pattern =~ s/$_/$_/xeg foreach (@{ $patterns });
+    }
+    return $pattern;
+}
+
+# verify :: [Char] -> [Char] -> [Char] -> HASH -> Int
+# @match :: match type (regex|approx|R|string|exact|S|smart|s|none|-)
+# @uri   :: uri
+# @pat   :: pattern to match agains @uri
+# @patterns :: ?
+sub verify($$$;$) {
+    my $match = shift;
+    my $uri   = shift;
+    my $pat   = shift;
+    my $patterns = shift || undef;
+
+    my $rc = ERROR;
+    if ($match eq q/regex/ or $match eq q/approx/ or $match eq q/R/) {
+        print "[B] $pat\n" if $VERBOSE;
+        $pat = prepare $pat, $patterns;
+        print "[A] $pat\n" if $VERBOSE;
+        $rc = $uri =~ /$pat/;
+    } elsif ($match eq q/string/ or $match eq q/exact/ or $match eq q/S/) {
+        $rc = $uri eq $pat;
+    } elsif ($match eq q/smart/ or $match eq q/s/) {
+        $rc = $uri ~~ $pat;
+    } elsif ($match eq q/none/ or $match eq q/-/) {
+        $rc = 1;
+    }
+
+    return int $rc;
+}
+
+# status  :: [[Char]] -> Int -> Int
+# @msg    :: Message to print
+# @status :: 
+sub status($$) {
+    my $msg    = shift;
+    my $status = shift;
+
+    my $w = int($cols * 1.0);
+    $w -= (17 + length $msg);
+
+    if (0 == $status) {
+        failed ">", 2, $msg;
+        failed ".", $w ; print NEWLINE;
+    } else {
+        ok ">", 2, $msg;
+        ok ".", $w ; print NEWLINE;
+    }
+
+    return $status;
+}
+
+
+sub set_agent($$) {
+    $_[0]->agent($_[1]);
+}
+
+sub set_timeout($$) {
+    $_[0]->timeout($_[1]);
+}
+
+
+sub get_domain($) {
+    my $url = shift;
+    return (split /\//, $url)[2];
+}
+
+# set_cookies :: UserAgent::String -> URI::String -> Cookies::HASH -> ?
+# set_cookies :: [[Char]] -> [[Char]] -> HASH -> ?
+# @ua         :: UserAgent Object
+# @uri        :: URL to request
+# @cookies    :: HASH with cookies to set
+sub set_cookies($$;$) {
+    my $ua  = shift;
+    my $uri = shift;
+    my $cookies = shift || {};
+
+    my $port = 80;
+    my $secure = FALSE;
+
+    return unless scalar %{ $cookies }; # return on empty hash
+    print "Handling cookies ....\n" if $VERBOSE;
+
+    my $cookiejar = new HTTP::Cookies:: file => $COOKIES, autosave => 1;
+    if (exists $cookies->{secure}) {
+        $secure = $cookies->{secure}; # eq q/yes/ ? TRUE : FALSE;
+        delete $cookies->{secure};
+
+        $port = 443 if $secure and not exists $cookies->{port};
+    }
+
+    if (exists $cookies->{port}) {
+        $port = $cookies->{port};
+        delete $cookies->{port};
+    }
+
+
+    while (my ($ckkey, $ckval) = each %{ $cookies }) {
+        my $domain = &get_domain($uri);
+        print "[$domain] K:$ckkey - V:$ckval\n" if $VERBOSE;
+        $cookiejar->set_cookie(time, $ckkey, $ckval, q:/:, &get_domain($uri), $port, FALSE, $secure, 86400, FALSE, {});
+    }
+
+    $ua->cookie_jar( $cookiejar );
+}
+
+# check :: 
+sub check() {
+    my $ua = new LWP::UserAgent::;
+
+    set_agent($ua, $AGENT);
+    set_timeout($ua, $TIMEOUT);
+
+    my ($req, $rsp);
+    my @redirects;
+    my @sources;
+    my @failed;
+    my @yaml = @{ $yaml };
+
+    $LAST = scalar @yaml unless defined $LAST;
+    $LAST = scalar @yaml unless $LAST < scalar @yaml;
+
+    $FIRST = 0 unless defined $FIRST;
+    $FIRST = $LAST unless $FIRST < $LAST;
+
+    @yaml = @{ $yaml }[$FIRST .. $LAST-1];
+
+    my $idx = $FIRST;
+    foreach (@yaml) {
+        @sources = ref($_->{source}->{uri}) ne q/ARRAY/ ? ($_->{source}->{uri},) : @{ $_->{source}->{uri} };
+
+        foreach my $requri (@sources) {
+            set_agent($ua, $_->{useragent}->{string} || $AGENT);
+            set_cookies($ua, $requri, $_->{cookies});
+            $req = new HTTP::Request:: HEAD => $requri;
+
+            cprint WHITE, "[$idx] Request: ";
+            cprint YELLOW, $requri, NEWLINE;
+            $rsp = $ua->request($req);
+
+            @redirects = ();
+            @redirects = ($rsp->redirects, $rsp);
+            if (scalar @redirects) {
+                shift @redirects;
+                cprint WHITE, "[$idx] Response: ";
+                print "one of [ \n     ";
+                cprint BLUE, +join ",\n     ", ($_->{redirect}->{uri} , $_->{target}->{uri});
+                print " ]", NEWLINE;
+
+                my ($match, $msg, $uri, $status);
+                foreach my $red ( @redirects ) {
+                    $uri = $red->request->uri;
+                    $msg = join ' ', +($uri,);
+
+                    if ($VERBOSE) {
+                        cprint WHITE, "[$idx] Redirected to: ";
+                        cprint CYAN, $uri;
+                        print NEWLINE;
+                    }
+
+                    $status = ERROR;
+                    # target first
+                    $match = $_->{target}->{match};
+                    if ( $_->{target}->{uri} ne q/-/) {
+                        $_->{target}->{patterns} = undef unless exists $_->{target}->{patterns};
+                        $status = status( join(' ', ("T: ", $msg)), verify $match, $uri, $_->{target}->{uri}, $_->{target}->{patterns});
+                    }
+
+                    unless ($status) {
+                        # redirects next
+                        $match = $_->{redirect}->{match};
+                        if ( $_->{redirect}->{uri} ne q/-/) {
+                            $_->{redirect}->{patterns} = undef unless exists $_->{redirect}->{patterns};
+                            $status = status( join(' ', ("R: ", $msg)), verify $match, $uri, $_->{redirect}->{uri}, $_->{redirect}->{patterns});
+                        }
+                    }
+                }
+                unless ($status) { # nothing matched
+                    status( "BLACKHOLE! NO MATCH FOUND for *** $requri ***!", ERROR );
+                    push @failed, $requri;
+                }
+            }
+
+            print NEWLINE;
+        }
+        ++$idx;
+    }
+
+    return [ @failed ];
+}
+
+# Load  :: String -> HASH(yaml)
+# @file :: YAML?-file to load
+sub load($) {
+    my $file = shift;
+    my $outfile = $file . '.yaml';
+
+    my $fh;
+    open $fh, "< $file" or die "Cannot open file '$file'\n";
+    my @content = <$fh>;
+    close $fh;
+
+    # (global patterns, local patterns, global cookies, local cookies)
+    my (@patterns, @xpatterns, @cookies, @xcookies);
+    my (@srcs, $src, $rdr, $dst, $rmatch, $dmatch, $port, $usragnt);
+    my $yaml = [];
+
+    foreach (@content) {
+        chomp;
+
+        my @line = split /\s+/;
+        my $flag = shift @line;
+
+        # skip comments
+        next if /^#/;
+        next if /^$/;
+
+        print "flag: ($flag) \n" if $VERBOSE;
+        if ( $flag eq q/P/ ) { # patterns
+            push @patterns, @line;
+        } elsif ( $flag eq q/p/ ) {
+            push @xpatterns, @line;
+        } elsif ( $flag eq q/S/ ) { # source(s)
+            push @srcs, @line;
+        } elsif ( $flag eq q/R/ ) { # redirect
+            ($rmatch, $rdr) = @line;
+
+            # default to string matching
+            unless ($rdr) {
+                $rdr = $rmatch;
+                $rmatch = q/S/;
+            }
+        } elsif ( $flag eq q/T/ ) { # target
+            ($dmatch, $dst) = @line;
+
+            # default to regexp matching
+            unless ($dst) {
+                $dst = $dmatch;
+                $dmatch = q/R/;
+            }
+        } elsif ( $flag eq q/C/ ) { # handle global cookies
+            push @cookies , split /=/, +(shift @line);
+        } elsif ( $flag eq q/c/ ) { # handle local cookies
+            push @xcookies, split /=/, +(shift @line);
+        } elsif ( $flag eq q/p/ ) { # cookie port
+            $port = shift @line;
+        } elsif ( $flag eq q/U/ ) { # user agent
+            $usragnt = join ' ', @line;
+        } elsif ( $flag eq q/-/ ) { # create node
+            if ( 1 == scalar @srcs ) { #only one src found -> scalar
+                $src = shift @srcs;
+            }
+
+            my $sref;
+            if (defined $src) {
+                $sref = $src;
+            } else {
+                $sref = [ @srcs ];
+            }
+
+            print "+cookies: <@cookies, @xcookies> -- ", scalar @cookies, "\n" if $VERBOSE;
+            unless (exists { @cookies }->{port}) {
+                $port = 80 unless defined $port;
+                push @cookies, ('port', $port);
+            }
+            print "-cookies: <@cookies, @xcookies>\n" if $VERBOSE;
+
+
+            push @{ $yaml }, {
+                useragent => { string   => $usragnt },
+                source    => { uri      => $sref },
+                redirect  => { uri      => $rdr,
+                               match    => $rmatch, },
+                target    => { uri      => $dst,
+                               match    => $dmatch,
+                               patterns => [ @patterns, @xpatterns ], },
+                cookies   => { +(@cookies, @xcookies) },
+            };
+
+            # reset
+            @srcs = (); @xcookies = ();
+            ($src, $dst, $rdr, $rmatch, $dmatch, $port, $usragnt) = ();
+        }
+    }
+
+
+    return $yaml;
+};
+
+sub summary($) {
+    my $failed = shift ;
+
+    if ( @{ $failed } ) { # are there any urls?
+        print "Summary of failed URLs\n";
+        print "$_\n" foreach @{ $failed };
+    }
+
+};
+
+
+# doc
+=head1 NAME
+
+SX::ModRewrite?
+
+=head1 SYNOPSIS
+
+TODO
+
+=head1 DESCRIPTION
+
+B<modrewrite> aims at helping you to verify I<Rewrites>.
+
+=head1 SUBROUTINES
+
+
+
+=over 2
+
+=item I<ok($separator, $width; @message)>
+
+=item I<failed($separator, $width; @message)>
+
+=item I<prepare($pattern, $patterns)>
+
+=item I<status($message, $status)>
+
+=item I<verify($type, $uri, $pattern; $patterns)>
+
+=item I<check()>
+
+=item I<set_agent($ua, $agent)>
+
+=item I<set_cookies($ua, $uri; $cookies>
+
+=item I<load($file)>
+
+=item I<summary($failed)>
+
+
+=back
+
+=head1 EXAMPLES
+
+=over 2
+
+=item B<P> Patterns
+
+=item B<S> Source URI(s)
+
+=item B<R> Redirect URI
+
+=item B<T> Target URI
+
+=item B<code>
+
+ P start\? ;
+ P tab_identifier=\d+
+ %
+ S src-uri-1
+ S src-uri-2
+ S ...
+ R S redirect (string match)(or)
+ R R redirect (regexp match)
+ T R dst-uri (regexp match)(or)
+ T S dst-uri (string match)
+ -
+
+=back

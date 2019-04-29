@@ -1,0 +1,76 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+
+eval {
+    require Data::Dumper::Again;
+    Data::Dumper::Again->import();
+    1;
+};
+
+my $dd;
+unless ($@) {
+    #use Data::Dumper::Again;
+    $dd = Data::Dumper::Again->new(purity => 1, terse => 1, deepcopy => 1, quotekeys => 1, sortkeys => 1, deparse => 1);
+};
+
+use Data::Dumper;
+
+my $LSOF = -x q(/usr/bin/lsof) && q(/usr/bin/lsof) || q(/usr/sbin/lsof);
+
+my $fh = undef;
+open $fh, "< /proc/locks" or die "Failed to open '/proc/locks'";
+my @locks = <$fh> ;
+close $fh;
+
+my %inodes;
+foreach (@locks) {
+    chomp;
+    my ($pid, $inode);
+    my $filename = "undef";
+
+    if (/(?:READ|WRITE)\s+(\d+)\s+([\S]+)/) {
+        $pid = $1;
+        $inode = (split /:/, $2)[-1];
+    }
+
+    my $lsof = undef;
+    next unless $pid;
+ 
+    open $lsof, "$LSOF -p $pid 2>&1 |" or next;
+    my @match = grep /$inode/, +map { $_ } <$lsof>;
+    chomp( my $match = $match[-1] || shift @match ) if scalar @match;
+    close $lsof;
+
+
+    my ($proc, undef, undef, $fd, undef, undef, undef, undef, @files) = split /\s+/, $match if scalar @match;
+    $filename = join ' ', @files;
+    $proc = "noproc" unless $proc;
+    $fd   = "-" unless $fd;
+
+    $filename .= " ***" if $fd =~ /W$/;
+    push @{ $inodes{$inode} }, [$proc, $pid, $fd, $filename];
+}
+
+#print $dd->dump( \%inodes );
+#print Dumper(\%inodes);
+my $filter = shift @ARGV || undef;
+my $lock_dups = 0;
+my $lock_all = 0;
+for my $inode (sort keys %inodes) {
+    my $numnodes = scalar @{ $inodes{$inode} };
+
+    next if $filter and not (grep /$filter/, map { $_->[0] } @{ $inodes{$inode} });
+
+    $lock_all += $numnodes;
+    if ($numnodes > 1) {
+        printf "%s %3d %s\n", "="x44, $numnodes, "="x44;
+        map { printf "%-11s %-8d %-11d %-5s %-s\n", $_->[0], $_->[1], $inode, $_->[2], $_->[3] } @{ $inodes{$inode} };
+        $lock_dups += $numnodes;
+    }
+
+}
+printf "%s Total: %3d/%3d %s\n", "="x38, $lock_dups, $lock_all, "="x39 if $lock_dups > 0;
+
+1;
